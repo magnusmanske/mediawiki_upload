@@ -2,19 +2,30 @@
 name = "mediawiki_upload"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 description = "Upload files to a MediaWiki wiki through its Action API"
 keywords = ["mediawiki", "wikimedia", "upload", "oauth"]
 categories = ["api-bindings", "web-programming"]
 
+[features]
+default = []
+# Wikimedia-specific helpers: Commons pre-upload checks and SHA-1 facts.
+wikimedia = []
+# The same checks against the Toolforge wiki replicas instead of the API.
+# Enables an optional GPL-3.0 dependency (the `toolforge` crate).
+toolforge-replicas = ["wikimedia", "dep:toolforge"]
+
 [dependencies]
 base64 = "0.22"
 hmac = "0.12"
-reqwest = { version = "0.13", features = ["form", "json", "multipart", "stream"] }
+reqwest = { version = "0.13", features = ["form", "json", "multipart", "query", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
 thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util"] }
+toolforge = { version = "6.2", features = ["wikipool"], optional = true }
 url = "2"
 urlencoding = "2"
 

@@ -83,6 +83,12 @@ impl UploadFailure {
             ("was-deleted", "this filename was deleted before"),
             ("badfilename", "the wiki would rename the file to"),
             ("emptyfile", "the file is empty"),
+            ("empty-file", "the file is empty"),
+            ("no-change", "the current file has the same contents"),
+            (
+                "duplicate-version",
+                "an older version of the file has the same contents",
+            ),
             (
                 "filetype-unwanted-type",
                 "this file type is not wanted on the wiki",
@@ -239,6 +245,29 @@ pub enum UploadError {
         /// The I/O error.
         #[source]
         source: std::io::Error,
+    },
+
+    /// The upload source is not a regular file.
+    #[error("{path} is not a regular file")]
+    NotAFile {
+        /// The path that was rejected.
+        path: PathBuf,
+    },
+
+    /// A chunked upload returned a result that does not fit the protocol.
+    #[error("unexpected chunk upload result: {result}")]
+    UnexpectedChunkResult {
+        /// The result MediaWiki returned.
+        result: String,
+    },
+
+    /// A chunked upload reported an offset that does not match the data sent.
+    #[error("chunk upload offset mismatch: expected {expected}, got {actual}")]
+    UnexpectedChunkOffset {
+        /// The offset after the chunk that was sent.
+        expected: u64,
+        /// The offset MediaWiki reported.
+        actual: u64,
     },
 
     /// The `upload` member has an unexpected shape.

@@ -5,8 +5,11 @@ use std::str::FromStr;
 use thiserror::Error;
 use url::Url;
 
-/// MediaWiki's maximum title length, in bytes.
-const MAX_TITLE_BYTES: usize = 255;
+/// MediaWiki's maximum file-name length, in bytes.
+///
+/// `UploadBase` restricts the name to 240 bytes because the `oi_archive_name`
+/// database column is 255 bytes and old versions add a timestamp and `!`.
+const MAX_FILE_NAME_BYTES: usize = 240;
 
 /// Characters MediaWiki does not allow in a title.
 const FORBIDDEN_CHARACTERS: [char; 8] = ['#', '<', '>', '[', ']', '|', '{', '}'];
@@ -31,8 +34,8 @@ pub enum FileNameError {
     #[error("the file name contains a forbidden character: {0:?}")]
     ForbiddenCharacter(char),
 
-    /// The name is longer than MediaWiki's title limit.
-    #[error("the file name is longer than {MAX_TITLE_BYTES} bytes")]
+    /// The name is longer than MediaWiki's file-name limit.
+    #[error("the file name is longer than {MAX_FILE_NAME_BYTES} bytes")]
     TooLong,
 
     /// A URL was given, but its path has no final segment to use as a name.
@@ -73,7 +76,7 @@ impl FileName {
         };
         let mut normalized: String = first.to_uppercase().collect();
         normalized.push_str(characters.as_str());
-        if normalized.len() > MAX_TITLE_BYTES {
+        if normalized.len() > MAX_FILE_NAME_BYTES {
             return Err(FileNameError::TooLong);
         }
         Ok(Self(normalized))
@@ -209,7 +212,9 @@ mod tests {
 
     #[test]
     fn rejects_overlong_names() {
-        let name = "a".repeat(MAX_TITLE_BYTES + 1);
+        let name = "a".repeat(MAX_FILE_NAME_BYTES + 1);
         assert_eq!(FileName::new(&name).unwrap_err(), FileNameError::TooLong);
+        let name = "a".repeat(MAX_FILE_NAME_BYTES);
+        assert!(FileName::new(&name).is_ok());
     }
 }

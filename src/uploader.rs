@@ -11,10 +11,18 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use url::Url;
 
 /// The Action API of Wikimedia Commons.
 pub const COMMONS_API: &str = "https://commons.wikimedia.org/w/api.php";
+
+/// The chunk size used by [`UploadRequest::chunked`].
+///
+/// MediaWiki requires non-final chunks to be at least 1 KiB on Wikimedia
+/// wikis; 5 MiB keeps the number of requests moderate while staying far above
+/// that minimum.
+pub const DEFAULT_CHUNK_SIZE: u64 = 5 * 1024 * 1024;
 
 /// A single upload request.
 ///
@@ -28,6 +36,7 @@ pub struct UploadRequest {
     comment: String,
     ignore_warnings: bool,
     blocking_warnings: Vec<String>,
+    chunk_size: Option<u64>,
 }
 
 impl UploadRequest {
@@ -39,6 +48,7 @@ impl UploadRequest {
             comment: String::new(),
             ignore_warnings: false,
             blocking_warnings: Vec::new(),
+            chunk_size: None,
         }
     }
 
@@ -67,7 +77,7 @@ impl UploadRequest {
     /// Warning keys that must still stop the upload when warnings are being
     /// ignored.
     ///
-    /// When this is non-empty, the first request is made without
+    /// When this is non-empty, the first upload request is made without
     /// `ignorewarnings`. If the wiki reports only cosmetic warnings, the
     /// stashed file is published; if one of these keys is present, the upload
     /// is refused and the warnings are returned in [`UploadFailure`].
@@ -89,6 +99,25 @@ impl UploadRequest {
     pub fn block_duplicates(mut self) -> Self {
         self.add_blocking_warning("duplicate".to_string());
         self.add_blocking_warning("duplicate-archive".to_string());
+        self
+    }
+
+    /// Uploads files larger than [`DEFAULT_CHUNK_SIZE`] in chunks.
+    ///
+    /// Smaller files use a single request. Use [`Self::chunk_size`] to choose
+    /// a different threshold and chunk size.
+    pub fn chunked(mut self) -> Self {
+        self.chunk_size = Some(DEFAULT_CHUNK_SIZE);
+        self
+    }
+
+    /// Uploads files larger than `bytes` in chunks of at most `bytes`.
+    ///
+    /// This is also the threshold: a file no larger than `bytes` is uploaded
+    /// in one request. A value of `0` disables chunking. The wiki's minimum
+    /// chunk size still applies, so do not choose less than a few KiB.
+    pub fn chunk_size(mut self, bytes: u64) -> Self {
+        self.chunk_size = (bytes > 0).then_some(bytes);
         self
     }
 
@@ -195,23 +224,61 @@ impl Uploader {
         bytes: impl Into<Vec<u8>>,
         request: UploadRequest,
     ) -> Result<UploadSuccess, UploadError> {
-        let part = Part::bytes(bytes.into()).file_name(request.filename.as_str().to_string());
+        let bytes = bytes.into();
+        let size = bytes.len() as u64;
+        if let Some(chunk_size) = request.chunk_size.filter(|chunk_size| size > *chunk_size) {
+            return self
+                .upload_bytes_chunked(bytes, size, chunk_size, request)
+                .await;
+        }
+        let part = Part::bytes(bytes).file_name(request.filename.as_str().to_string());
         self.upload_part(&request, part).await
     }
 
     /// Uploads a file from disk, streaming it into the multipart request.
+    ///
+    /// Files larger than the request's `chunk_size` are uploaded in chunks
+    /// instead.
     pub async fn upload_file(
         &self,
         path: impl AsRef<Path>,
         request: UploadRequest,
     ) -> Result<UploadSuccess, UploadError> {
         let path = path.as_ref();
-        let part = Part::file(path).await.map_err(|source| UploadError::File {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let metadata = tokio::fs::metadata(path)
+            .await
+            .map_err(|source| file_error(path, source))?;
+        if !metadata.is_file() {
+            return Err(UploadError::NotAFile {
+                path: path.to_path_buf(),
+            });
+        }
+        let size = metadata.len();
+        if let Some(chunk_size) = request.chunk_size.filter(|chunk_size| size > *chunk_size) {
+            return self
+                .upload_file_chunked(path, size, chunk_size, request)
+                .await;
+        }
+        let part = Part::file(path)
+            .await
+            .map_err(|source| file_error(path, source))?;
         let part = part.file_name(request.filename.as_str().to_string());
         self.upload_part(&request, part).await
+    }
+
+    /// Publishes a file that MediaWiki left in the upload stash.
+    ///
+    /// An [`UploadFailure`] carries the `file_key` of such a file. A caller
+    /// that has inspected the warnings and decided to publish anyway can pass
+    /// it here together with the request used for the upload.
+    pub async fn publish_stashed(
+        &self,
+        request: &UploadRequest,
+        file_key: &str,
+    ) -> Result<UploadSuccess, UploadError> {
+        let token = self.csrf_token().await?;
+        let status = self.stashed_upload(request, &token, file_key, true).await?;
+        upload_success(status, request)
     }
 
     async fn upload_part(
@@ -231,34 +298,104 @@ impl Uploader {
         let builder = self.client.post(self.api_url.clone()).multipart(form);
         let builder = self.authorize(builder, "POST", &[])?;
         let answer = self.send(builder).await?;
-        let mut status = parse_upload(&answer)?;
+        let status = parse_upload(&answer)?;
 
         if status.result == "Warning" && !request.blocking_warnings.is_empty() {
-            let blocked = request
-                .blocking_warnings
-                .iter()
-                .any(|key| warning_is_present(status.warnings.get(key)));
-            if blocked {
+            if has_blocking_warning(request, &status) {
                 return Err(UploadError::Upload(upload_failure(status)));
             }
             if request.ignore_warnings {
                 let file_key = status.filekey.clone().ok_or(UploadError::MissingFileKey)?;
-                let publish_fields = publish_fields(&fields, &file_key);
-                let answer = self.post_form(&publish_fields).await?;
-                status = parse_upload(&answer)?;
+                let status = self
+                    .stashed_upload(request, &token, &file_key, true)
+                    .await?;
+                return upload_success(status, request);
             }
         }
+        upload_success(status, request)
+    }
 
-        if status.result != "Success" {
-            return Err(UploadError::Upload(upload_failure(status)));
+    async fn upload_bytes_chunked(
+        &self,
+        bytes: Vec<u8>,
+        size: u64,
+        chunk_size: u64,
+        request: UploadRequest,
+    ) -> Result<UploadSuccess, UploadError> {
+        let token = self.csrf_token().await?;
+        let mut upload = ChunkUpload::new(self, &request, token, size);
+        let chunk_len = usize::try_from(chunk_size).unwrap_or(usize::MAX).max(1);
+        for chunk in bytes.chunks(chunk_len) {
+            upload.send(chunk.to_vec()).await?;
         }
+        upload.finish().await
+    }
 
-        Ok(UploadSuccess {
-            filename: status
-                .filename
-                .unwrap_or_else(|| request.filename.as_str().to_string()),
-            warnings: status.warnings,
-        })
+    async fn upload_file_chunked(
+        &self,
+        path: &Path,
+        size: u64,
+        chunk_size: u64,
+        request: UploadRequest,
+    ) -> Result<UploadSuccess, UploadError> {
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .map_err(|source| file_error(path, source))?;
+        let token = self.csrf_token().await?;
+        let mut upload = ChunkUpload::new(self, &request, token, size);
+        let mut offset = 0u64;
+        while offset < size {
+            let this_len = (size - offset).min(chunk_size) as usize;
+            let mut buffer = vec![0u8; this_len];
+            file.read_exact(&mut buffer)
+                .await
+                .map_err(|source| file_error(path, source))?;
+            upload.send(buffer).await?;
+            offset += this_len as u64;
+        }
+        upload.finish().await
+    }
+
+    async fn commit_stashed(
+        &self,
+        request: &UploadRequest,
+        token: &str,
+        initial_file_key: &str,
+    ) -> Result<UploadSuccess, UploadError> {
+        let mut file_key = initial_file_key.to_string();
+        let mut status = self
+            .stashed_upload(
+                request,
+                token,
+                &file_key,
+                request.ignore_warnings && request.blocking_warnings.is_empty(),
+            )
+            .await?;
+
+        if status.result == "Warning" && !request.blocking_warnings.is_empty() {
+            if has_blocking_warning(request, &status) {
+                return Err(UploadError::Upload(upload_failure(status)));
+            }
+            if request.ignore_warnings {
+                if let Some(key) = status.filekey.clone() {
+                    file_key = key;
+                }
+                status = self.stashed_upload(request, token, &file_key, true).await?;
+            }
+        }
+        upload_success(status, request)
+    }
+
+    async fn stashed_upload(
+        &self,
+        request: &UploadRequest,
+        token: &str,
+        file_key: &str,
+        ignore_warnings: bool,
+    ) -> Result<UploadStatus, UploadError> {
+        let fields = stashed_fields(request, token, file_key, ignore_warnings);
+        let answer = self.post_form(&fields).await?;
+        parse_upload(&answer)
     }
 
     async fn csrf_token(&self) -> Result<String, UploadError> {
@@ -340,9 +477,115 @@ impl Uploader {
     }
 }
 
-/// The parameters MediaWiki needs for a first upload request.
-fn upload_fields(request: &UploadRequest, token: &str) -> Vec<(String, String)> {
-    let mut fields = vec![
+/// A chunked upload in progress.
+struct ChunkUpload<'a> {
+    uploader: &'a Uploader,
+    request: &'a UploadRequest,
+    token: String,
+    size: u64,
+    offset: u64,
+    file_key: Option<String>,
+    index: usize,
+}
+
+impl<'a> ChunkUpload<'a> {
+    fn new(uploader: &'a Uploader, request: &'a UploadRequest, token: String, size: u64) -> Self {
+        Self {
+            uploader,
+            request,
+            token,
+            size,
+            offset: 0,
+            file_key: None,
+            index: 0,
+        }
+    }
+
+    async fn upload_chunk(&self, chunk: Vec<u8>) -> Result<UploadStatus, UploadError> {
+        let mut fields = vec![
+            ("action".to_string(), "upload".to_string()),
+            ("format".to_string(), "json".to_string()),
+            ("assert".to_string(), "user".to_string()),
+            (
+                "filename".to_string(),
+                self.request.filename.as_str().to_string(),
+            ),
+            ("filesize".to_string(), self.size.to_string()),
+            ("offset".to_string(), self.offset.to_string()),
+            ("stash".to_string(), "1".to_string()),
+            ("ignorewarnings".to_string(), "1".to_string()),
+            ("token".to_string(), self.token.clone()),
+        ];
+        if let Some(file_key) = self.file_key.as_deref() {
+            fields.push(("filekey".to_string(), file_key.to_string()));
+        }
+
+        let part = Part::bytes(chunk).file_name(format!("chunk-{}", self.index));
+        let mut form = Form::new();
+        for (key, value) in &fields {
+            form = form.text(key.clone(), value.clone());
+        }
+        form = form.part("chunk", part);
+
+        let builder = self
+            .uploader
+            .client
+            .post(self.uploader.api_url.clone())
+            .multipart(form);
+        let builder = self.uploader.authorize(builder, "POST", &[])?;
+        let answer = self.uploader.send(builder).await?;
+        parse_upload(&answer)
+    }
+
+    async fn send(&mut self, chunk: Vec<u8>) -> Result<(), UploadError> {
+        let chunk_len = chunk.len() as u64;
+        let is_last = self.offset + chunk_len >= self.size;
+        let status = self.upload_chunk(chunk).await?;
+
+        if !is_last && status.result != "Continue" {
+            return Err(UploadError::UnexpectedChunkResult {
+                result: status.result,
+            });
+        }
+        if is_last && !matches!(status.result.as_str(), "Success" | "Continue" | "Warning") {
+            return Err(UploadError::UnexpectedChunkResult {
+                result: status.result,
+            });
+        }
+
+        let expected_offset = self.offset + chunk_len;
+        if let Some(offset) = status.offset
+            && offset != expected_offset
+        {
+            return Err(UploadError::UnexpectedChunkOffset {
+                expected: expected_offset,
+                actual: offset,
+            });
+        }
+
+        self.file_key = Some(
+            status
+                .filekey
+                .clone()
+                .or_else(|| self.file_key.clone())
+                .ok_or(UploadError::MissingFileKey)?,
+        );
+        self.offset = expected_offset;
+        self.index += 1;
+        Ok(())
+    }
+
+    async fn finish(self) -> Result<UploadSuccess, UploadError> {
+        let file_key = self.file_key.ok_or(UploadError::MissingFileKey)?;
+        self.uploader
+            .commit_stashed(self.request, &self.token, &file_key)
+            .await
+    }
+}
+
+/// The parameters shared by every upload request.
+fn base_fields(request: &UploadRequest) -> Vec<(String, String)> {
+    vec![
         ("action".to_string(), "upload".to_string()),
         ("format".to_string(), "json".to_string()),
         ("assert".to_string(), "user".to_string()),
@@ -352,26 +595,35 @@ fn upload_fields(request: &UploadRequest, token: &str) -> Vec<(String, String)> 
         ),
         ("comment".to_string(), request.comment.clone()),
         ("text".to_string(), request.text.clone()),
-        ("token".to_string(), token.to_string()),
-    ];
+    ]
+}
+
+/// The parameters MediaWiki needs for a first, unchunked upload request.
+fn upload_fields(request: &UploadRequest, token: &str) -> Vec<(String, String)> {
+    let mut fields = base_fields(request);
+    fields.push(("token".to_string(), token.to_string()));
     if request.ignore_warnings && request.blocking_warnings.is_empty() {
         fields.push(("ignorewarnings".to_string(), "1".to_string()));
     }
     fields
 }
 
-/// The parameters for publishing a file that MediaWiki stashed while it
-/// reported warnings. The file is identified by `filekey`; there is no file
-/// part.
-fn publish_fields(fields: &[(String, String)], file_key: &str) -> Vec<(String, String)> {
-    let mut publish: Vec<(String, String)> = fields
-        .iter()
-        .filter(|(key, _)| key != "ignorewarnings")
-        .cloned()
-        .collect();
-    publish.push(("filekey".to_string(), file_key.to_string()));
-    publish.push(("ignorewarnings".to_string(), "1".to_string()));
-    publish
+/// The parameters for publishing a file that MediaWiki stashed, either after
+/// warnings or after a chunked upload. The file is identified by `file_key`;
+/// there is no file part.
+fn stashed_fields(
+    request: &UploadRequest,
+    token: &str,
+    file_key: &str,
+    ignore_warnings: bool,
+) -> Vec<(String, String)> {
+    let mut fields = base_fields(request);
+    fields.push(("token".to_string(), token.to_string()));
+    fields.push(("filekey".to_string(), file_key.to_string()));
+    if ignore_warnings {
+        fields.push(("ignorewarnings".to_string(), "1".to_string()));
+    }
+    fields
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,6 +634,8 @@ struct UploadStatus {
     filename: Option<String>,
     #[serde(default)]
     filekey: Option<String>,
+    #[serde(default)]
+    offset: Option<u64>,
     #[serde(default)]
     warnings: BTreeMap<String, Value>,
 }
@@ -399,12 +653,34 @@ fn parse_upload(answer: &Value) -> Result<UploadStatus, UploadError> {
     })
 }
 
+fn upload_success(
+    status: UploadStatus,
+    request: &UploadRequest,
+) -> Result<UploadSuccess, UploadError> {
+    if status.result != "Success" {
+        return Err(UploadError::Upload(upload_failure(status)));
+    }
+    Ok(UploadSuccess {
+        filename: status
+            .filename
+            .unwrap_or_else(|| request.filename.as_str().to_string()),
+        warnings: status.warnings,
+    })
+}
+
 fn upload_failure(status: UploadStatus) -> UploadFailure {
     UploadFailure {
         result: status.result,
         warnings: status.warnings,
         file_key: status.filekey,
     }
+}
+
+fn has_blocking_warning(request: &UploadRequest, status: &UploadStatus) -> bool {
+    request
+        .blocking_warnings
+        .iter()
+        .any(|key| warning_is_present(status.warnings.get(key)))
 }
 
 /// Warnings that are present and say something. MediaWiki represents a
@@ -416,6 +692,13 @@ fn warning_is_present(value: Option<&Value>) -> bool {
         Some(Value::Array(values)) => !values.is_empty(),
         Some(Value::Object(values)) => !values.is_empty(),
         Some(_) => true,
+    }
+}
+
+fn file_error(path: &Path, source: std::io::Error) -> UploadError {
+    UploadError::File {
+        path: path.to_path_buf(),
+        source,
     }
 }
 
@@ -451,18 +734,23 @@ mod tests {
     }
 
     #[test]
-    fn publish_fields_drop_the_file_and_set_the_key() {
-        let fields = upload_fields(&request().ignore_warnings(true), "token");
-        let publish = publish_fields(&fields, "file-key");
-        assert!(!publish.iter().any(|(key, _)| key == "file"));
-        assert!(publish.contains(&("filekey".to_string(), "file-key".to_string())));
-        assert!(publish.contains(&("ignorewarnings".to_string(), "1".to_string())));
+    fn stashed_fields_carry_the_file_key_and_no_file() {
+        let fields = stashed_fields(&request(), "token", "file-key", true);
+        assert!(!fields.iter().any(|(key, _)| key == "file"));
+        assert!(fields.contains(&("filekey".to_string(), "file-key".to_string())));
+        assert!(fields.contains(&("ignorewarnings".to_string(), "1".to_string())));
     }
 
     #[test]
     fn accepts_warning_slices() {
         let request = request().blocking_warnings(["duplicate", "duplicate"]);
         assert_eq!(request.blocking_warnings, vec!["duplicate".to_string()]);
+    }
+
+    #[test]
+    fn chunk_size_zero_disables_chunking() {
+        assert!(request().chunk_size(0).chunk_size.is_none());
+        assert_eq!(request().chunked().chunk_size, Some(DEFAULT_CHUNK_SIZE));
     }
 
     #[test]

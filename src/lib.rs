@@ -38,7 +38,13 @@
 //! * warnings can be inspected first, and cosmetic warnings can then be
 //!   overridden while byte-identical duplicates still stop the upload
 //!   ([`UploadRequest::block_duplicates`]);
+//! * large files can be uploaded in chunks ([`UploadRequest::chunked`]);
 //! * OAuth 1.0a signatures exclude the multipart body, as MediaWiki expects.
+//!
+//! With the `wikimedia` feature, the `wikimedia` module adds Commons
+//! pre-upload checks (file name, size, SHA-1 duplicates, deletion log) through
+//! the API; the `toolforge-replicas` feature adds the same checks against the
+//! Toolforge wiki replicas.
 //!
 //! There is deliberately no automatic retry: an upload is not always
 //! idempotent, and a retry policy belongs to the tool that knows whether the
@@ -57,8 +63,11 @@ mod filename;
 mod oauth1;
 mod uploader;
 
+#[cfg(feature = "wikimedia")]
+pub mod wikimedia;
+
 pub use credentials::Credentials;
 pub use error::{ApiError, UploadError, UploadFailure};
 pub use filename::{FileName, FileNameError};
 pub use oauth1::{OAuth1, OAuthError};
-pub use uploader::{COMMONS_API, UploadRequest, UploadSuccess, Uploader};
+pub use uploader::{COMMONS_API, DEFAULT_CHUNK_SIZE, UploadRequest, UploadSuccess, Uploader};

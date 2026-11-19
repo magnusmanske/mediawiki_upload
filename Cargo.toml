@@ -3,6 +3,7 @@ name = "mediawiki_upload"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
+authors = ["Magnus Manske <magnusmanske@proton.me>"]
 license = "MIT OR Apache-2.0"
 description = "Upload files to a MediaWiki wiki through its Action API"
 keywords = ["mediawiki", "wikimedia", "upload", "oauth"]

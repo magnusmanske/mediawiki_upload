@@ -39,6 +39,7 @@
 //!   overridden while byte-identical duplicates still stop the upload
 //!   ([`UploadRequest::block_duplicates`]);
 //! * large files can be uploaded in chunks ([`UploadRequest::chunked`]);
+//! * change tags can be attached ([`UploadRequest::tags`]);
 //! * OAuth 1.0a signatures exclude the multipart body, as MediaWiki expects.
 //!
 //! With the `wikimedia` feature, the `wikimedia` module adds Commons

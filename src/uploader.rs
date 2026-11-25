@@ -37,6 +37,7 @@ pub struct UploadRequest {
     ignore_warnings: bool,
     blocking_warnings: Vec<String>,
     chunk_size: Option<u64>,
+    tags: Vec<String>,
 }
 
 impl UploadRequest {
@@ -49,6 +50,7 @@ impl UploadRequest {
             ignore_warnings: false,
             blocking_warnings: Vec::new(),
             chunk_size: None,
+            tags: Vec::new(),
         }
     }
 
@@ -99,6 +101,24 @@ impl UploadRequest {
     pub fn block_duplicates(mut self) -> Self {
         self.add_blocking_warning("duplicate".to_string());
         self.add_blocking_warning("duplicate-archive".to_string());
+        self
+    }
+
+    /// Change tags to apply to the upload log entry and file version.
+    ///
+    /// MediaWiki expects a `|`-separated list. Empty values and duplicates are
+    /// dropped. The tags must already exist on the wiki.
+    pub fn tags<I, S>(mut self, tags: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for tag in tags {
+            let tag = tag.as_ref().trim();
+            if !tag.is_empty() && !self.tags.iter().any(|existing| existing.as_str() == tag) {
+                self.tags.push(tag.to_string());
+            }
+        }
         self
     }
 
@@ -585,7 +605,7 @@ impl<'a> ChunkUpload<'a> {
 
 /// The parameters shared by every upload request.
 fn base_fields(request: &UploadRequest) -> Vec<(String, String)> {
-    vec![
+    let mut fields = vec![
         ("action".to_string(), "upload".to_string()),
         ("format".to_string(), "json".to_string()),
         ("assert".to_string(), "user".to_string()),
@@ -595,7 +615,11 @@ fn base_fields(request: &UploadRequest) -> Vec<(String, String)> {
         ),
         ("comment".to_string(), request.comment.clone()),
         ("text".to_string(), request.text.clone()),
-    ]
+    ];
+    if !request.tags.is_empty() {
+        fields.push(("tags".to_string(), request.tags.join("|")));
+    }
+    fields
 }
 
 /// The parameters MediaWiki needs for a first, unchunked upload request.
@@ -739,6 +763,22 @@ mod tests {
         assert!(!fields.iter().any(|(key, _)| key == "file"));
         assert!(fields.contains(&("filekey".to_string(), "file-key".to_string())));
         assert!(fields.contains(&("ignorewarnings".to_string(), "1".to_string())));
+    }
+
+    #[test]
+    fn change_tags_are_sent_once() {
+        let request = request().tags(["flickr2commons", "flickr2commons", ""]);
+        assert_eq!(request.tags, vec!["flickr2commons".to_string()]);
+        let fields = upload_fields(&request, "token");
+        assert!(fields.contains(&("tags".to_string(), "flickr2commons".to_string())));
+        let fields = stashed_fields(&request, "token", "file-key", false);
+        assert!(fields.contains(&("tags".to_string(), "flickr2commons".to_string())));
+    }
+
+    #[test]
+    fn no_tags_means_no_parameter() {
+        let fields = upload_fields(&request(), "token");
+        assert!(!fields.iter().any(|(key, _)| key == "tags"));
     }
 
     #[test]
